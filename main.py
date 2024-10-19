@@ -1,403 +1,509 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import torch.optim as optim
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import confusion_matrix, roc_curve, auc, classification_report
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
 import pandas as pd
 import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from imblearn.over_sampling import RandomOverSampler
 import ast
-import gc
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import autocast, GradScaler
+import time
+from tqdm import tqdm
+import os
+import GPUtil
 
+# Early stopping toggle
+early_stop = "off"  # Set to "off" to disable early stopping
+
+# Set random seeds for reproducibility
 torch.manual_seed(42)
-torch.cuda.manual_seed_all(42)
+np.random.seed(42)
 
+# Set device and optimize CUDA operations
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
 print(f"Using device: {device}")
 
-# Enable mixed precision training
-scaler = torch.amp.GradScaler()
+# Function to print GPU usage
+def print_gpu_usage():
+    gpus = GPUtil.getGPUs()
+    if gpus:
+        gpu = gpus[0]
+        print(f"GPU Memory Usage: {gpu.memoryUsed} / {gpu.memoryTotal} MB")
+        print(f"GPU Memory Utilization: {gpu.memoryUtil * 100:.2f}%")
 
-# 1. Data Loading and Preprocessing
-print("Loading data...")
-file_path = '/content/drive/MyDrive/EANN/MELD.xlsx' 
+# Load the dataset
+file_path = '/content/drive/MyDrive/EANN/MELD.xlsx'
 df = pd.read_excel(file_path)
+print("Dataset loaded successfully.")
 
-print("Preprocessing data...")
+# Convert string representations to lists
 for col in ['V1', 'V2', 'V3', 'V4', 'A2']:
     df[col] = df[col].apply(ast.literal_eval)
+print("String representations converted to lists.")
 
+# Ensure utterances are strings
+df['Utterance'] = df['Utterance'].astype(str)
+
+# Encode emotion labels
 le = LabelEncoder()
 df['Emotion_encoded'] = le.fit_transform(df['Emotion'])
+print("Emotion labels encoded.")
 
-X = df[['V1', 'V2', 'V3', 'V4', 'A2']]
+# Print dataset information
+print("\nDataset Information:")
+print(f"Number of samples: {len(df)}")
+print(f"Number of features: {len(df.columns)}")
+print("\nEmotion distribution:")
+print(df['Emotion'].value_counts())
+
+# Print feature dimensions
+print("\nFeature dimensions:")
+for col in ['V1', 'V2', 'V3', 'V4', 'A2']:
+    print(f"{col}: {len(df[col].iloc[0])}")
+
+# Initialize BERT tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+print("BERT tokenizer initialized.")
+
+# Hyperparameters
+batch_size = 128
+accumulation_steps = 2
+max_length = 128
+num_epochs = 30
+patience = 5
+learning_rate = 2e-5
+
+# Function to tokenize text
+def tokenize_text(text, max_length=max_length):
+    return tokenizer(text, padding='max_length', truncation=True, max_length=max_length, return_tensors='pt')
+
+# Prepare features and labels
+X = df[['Utterance', 'V1', 'V3', 'V4', 'A2']]
 y = df['Emotion_encoded']
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
+# Oversample to handle class imbalance
+ros = RandomOverSampler(random_state=42)
+X_resampled, y_resampled = ros.fit_resample(X, y)
+
+print("\nClass distribution after oversampling:")
+print(pd.Series(y_resampled).value_counts())
+
+# Split the data into train and test sets
+X_train, X_test, y_train, y_test = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled)
+
+print("\nData split into train and test sets.")
+print(f"Training samples: {len(X_train)}")
+print(f"Testing samples: {len(X_test)}")
+
+# Custom Dataset class
 class MELDDataset(Dataset):
-    def __init__(self, features, labels):
-        self.features = features
+    def __init__(self, utterances, v1, v3, v4, a2, labels):
+        self.utterances = utterances
+        self.v1 = v1
+        self.v3 = v3
+        self.v4 = v4
+        self.a2 = a2
         self.labels = labels
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
+        utterance = self.utterances.iloc[idx]
+        tokenized = tokenize_text(utterance)
+
         return {
-            'V1': torch.tensor(self.features.iloc[idx]['V1'], dtype=torch.float32),
-            'V2': torch.tensor(self.features.iloc[idx]['V2'], dtype=torch.float32),
-            'V3': torch.tensor(self.features.iloc[idx]['V3'], dtype=torch.float32),
-            'V4': torch.tensor(self.features.iloc[idx]['V4'], dtype=torch.float32),
-            'A2': torch.tensor(self.features.iloc[idx]['A2'], dtype=torch.float32),
+            'input_ids': tokenized['input_ids'].squeeze(),
+            'attention_mask': tokenized['attention_mask'].squeeze(),
+            'v1': torch.tensor(self.v1.iloc[idx], dtype=torch.float32),
+            'v3': torch.tensor(self.v3.iloc[idx], dtype=torch.float32),
+            'v4': torch.tensor(self.v4.iloc[idx], dtype=torch.float32),
+            'a2': torch.tensor(self.a2.iloc[idx], dtype=torch.float32),
             'label': torch.tensor(self.labels.iloc[idx], dtype=torch.long)
         }
 
 # Create datasets and dataloaders
-train_dataset = MELDDataset(X_train, y_train)
-test_dataset = MELDDataset(X_test, y_test)
+train_dataset = MELDDataset(X_train['Utterance'], X_train['V1'], X_train['V3'], X_train['V4'], X_train['A2'], y_train)
+test_dataset = MELDDataset(X_test['Utterance'], X_test['V1'], X_test['V3'], X_test['V4'], X_test['A2'], y_test)
 
-batch_size = 32
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-# 2. Model Architecture
-class AudioEncoder(nn.Module):
-    def __init__(self):
-        super(AudioEncoder, self).__init__()
-        self.fc_v1 = nn.Linear(512, 256)
-        self.bn_v1 = nn.BatchNorm1d(256)
-        self.dropout_v1 = nn.Dropout(0.3)
-        self.conv_v34 = nn.Conv1d(2, 64, kernel_size=3, padding=1)
-        self.pool_v34 = nn.MaxPool1d(2)
-        self.fc_v34 = nn.Linear(64 * 12, 128)
-        self.fc_final = nn.Linear(384, 256)
-    
-    def forward(self, v1, v3, v4):
-        a_v1 = self.dropout_v1(self.bn_v1(F.relu(self.fc_v1(v1))))
-        v34 = torch.cat([v3.unsqueeze(1), v4.unsqueeze(1)], dim=1)
-        a_v34 = self.conv_v34(v34)
-        a_v34 = self.pool_v34(a_v34)
-        a_v34 = a_v34.view(a_v34.size(0), -1)
-        a_v34 = F.relu(self.fc_v34(a_v34))
-        combined = torch.cat([a_v1, a_v34], dim=1)
-        a_final = F.relu(self.fc_final(combined))
-        return a_final
+print("\nDataLoaders created successfully.")
+print(f"Number of batches in train_loader: {len(train_loader)}")
+print(f"Number of batches in test_loader: {len(test_loader)}")
 
-class TextEncoder(nn.Module):
-    def __init__(self):
-        super(TextEncoder, self).__init__()
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=512, nhead=8, dim_feedforward=512, batch_first=True),
-            num_layers=2
-        )
-        self.fc = nn.Linear(512, 256)
-    
-    def forward(self, v2):
-        t = torch.utils.checkpoint.checkpoint(self.transformer, v2)
-        t_final = F.relu(self.fc(t))
-        return t_final
-
-class VisualEncoder(nn.Module):
-    def __init__(self):
-        super(VisualEncoder, self).__init__()
-        self.fc = nn.Linear(512, 256)
-    
-    def forward(self, a2):
-        v_final = F.relu(self.fc(a2))
-        return v_final
-
-class CrossModalAttention(nn.Module):
-    def __init__(self, dim=256):
-        super(CrossModalAttention, self).__init__()
-        self.query_proj = nn.Linear(dim, dim)
-        self.key_proj = nn.Linear(dim, dim)
-        self.value_proj = nn.Linear(dim, dim)
-        self.scale = dim ** -0.5
-    
-    def forward(self, query, key, value):
-        q = self.query_proj(query)
-        k = self.key_proj(key)
-        v = self.value_proj(value)
-        
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        
-        out = torch.matmul(attn, v)
-        return out
-
-class MemoryEfficientTensorFusion(nn.Module):
-    def __init__(self, input_dim=256, output_dim=512):
-        super(MemoryEfficientTensorFusion, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.fc = nn.Linear(input_dim * 3, output_dim)
-        self.dropout = nn.Dropout(0.5)
-    
-    def forward(self, audio, text, visual):
-        fused = torch.cat([audio, text, visual], dim=1)
-        fused_features = F.relu(self.fc(fused))
-        fused_features = self.dropout(fused_features)
-        return fused_features
-
-class EmotionClassifier(nn.Module):
+class MultimodalEmotionRecognition(nn.Module):
     def __init__(self, num_classes=7):
-        super(EmotionClassifier, self).__init__()
-        self.audio_encoder = AudioEncoder()
-        self.text_encoder = TextEncoder()
-        self.visual_encoder = VisualEncoder()
-        self.cross_attn_at = CrossModalAttention()
-        self.cross_attn_tv = CrossModalAttention()
-        self.cross_attn_av = CrossModalAttention()
-        self.tfn = MemoryEfficientTensorFusion()
-        self.fc1 = nn.Linear(512, 128)
-        self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(128, num_classes)
-    
-    def forward(self, v1, v2, v3, v4, a2):
-        audio = self.audio_encoder(v1, v3, v4)
-        text = self.text_encoder(v2)
-        visual = self.visual_encoder(a2)
-        
-        audio_text = self.cross_attn_at(audio, text, text)
-        text_visual = self.cross_attn_tv(text, visual, visual)
-        audio_visual = self.cross_attn_av(audio, visual, visual)
-        
-        audio_final = audio + audio_text + audio_visual
-        text_final = text + text_visual
-        visual_final = visual + audio_visual
-        
-        fused_features = self.tfn(audio_final, text_final, visual_final)
-        
-        x = F.relu(self.fc1(fused_features))
-        x = self.dropout(x)
-        logits = self.fc2(x)
-        
+        super(MultimodalEmotionRecognition, self).__init__()
+
+        # Text Modality
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.text_fc = nn.Sequential(
+            nn.Linear(768, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        # Audio Modality
+        self.audio_v1_fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256)
+        )
+        self.audio_v34_fc = nn.Sequential(
+            nn.Linear(50, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128)
+        )
+        self.audio_combined_fc = nn.Sequential(
+            nn.Linear(384, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        # Visual Modality
+        self.visual_fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.3)
+        )
+
+        # Cross-Modal Attention
+        self.text_audio_attention = nn.MultiheadAttention(embed_dim=512, num_heads=8, batch_first=True)
+        self.text_visual_attention = nn.MultiheadAttention(embed_dim=512, num_heads=8, batch_first=True)
+
+        # Fusion Layer
+        self.fusion_fc = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        # Classification Layers
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, input_ids, attention_mask, v1, v3, v4, a2):
+        # Text Modality
+        bert_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        text_features = self.text_fc(bert_output.pooler_output)
+
+        # Audio Modality
+        audio_v1 = self.audio_v1_fc(v1)
+        audio_v34 = self.audio_v34_fc(torch.cat([v3, v4], dim=1))
+        audio_features = self.audio_combined_fc(torch.cat([audio_v1, audio_v34], dim=1))
+
+        # Visual Modality
+        visual_features = self.visual_fc(a2)
+
+        # Cross-Modal Attention
+        text_features_expanded = text_features.unsqueeze(1)
+        audio_features_expanded = nn.functional.pad(audio_features.unsqueeze(1), (0, 256))
+        visual_features_expanded = nn.functional.pad(visual_features.unsqueeze(1), (0, 256))
+
+        text_audio_attention, _ = self.text_audio_attention(text_features_expanded, audio_features_expanded, audio_features_expanded)
+        text_visual_attention, _ = self.text_visual_attention(text_features_expanded, visual_features_expanded, visual_features_expanded)
+
+        attended_features = text_features + text_audio_attention.squeeze(1) + text_visual_attention.squeeze(1)
+
+        # Fusion
+        fused_features = self.fusion_fc(torch.cat([attended_features, audio_features, visual_features], dim=1))
+
+        # Classification
+        logits = self.classifier(fused_features)
+
         return logits
 
-# 3. Training Loop with Focal Loss
+# Focal Loss implementation
 class FocalLoss(nn.Module):
     def __init__(self, alpha, gamma=2):
         super(FocalLoss, self).__init__()
-        self.alpha = alpha
+        self.alpha = alpha.to(device)
         self.gamma = gamma
-    
+
     def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        ce_loss = nn.CrossEntropyLoss(reduction='none')(inputs, targets)
         pt = torch.exp(-ce_loss)
         focal_loss = self.alpha[targets] * (1 - pt)**self.gamma * ce_loss
         return focal_loss.mean()
 
-def train_model(model, train_loader, val_loader, num_epochs=100):
-    model.to(device)
-    
-    class_counts = df['Emotion'].value_counts().sort_index()
-    class_weights = 1 / torch.Tensor(class_counts.values)
+# Training function
+def train_model(model, train_loader, val_loader, num_epochs=num_epochs, patience=patience):
+    print("Starting model training...")
+    print(f"Early stopping is {early_stop}")
+
+    # Compute class weights for Focal Loss
+    class_counts = torch.tensor([4709] * 7)  # All classes have 4709 samples after oversampling
+    class_weights = 1.0 / class_counts
     class_weights = class_weights / class_weights.sum()
-    class_weights = class_weights.to(device)
-    
-    criterion = FocalLoss(alpha=class_weights)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
-    
+
+    criterion = FocalLoss(alpha=class_weights.to(device), gamma=2)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5)
+    scaler = GradScaler()
+
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+
     train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
-    
+    train_accuracies, val_accuracies = [], []
+
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
-        
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            v1, v2, v3, v4, a2, labels = [b.to(device) for b in batch.values()]
-            
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(v1, v2, v3, v4, a2)
+        optimizer.zero_grad()
+
+        start_time = time.time()
+
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            v1 = batch['v1'].to(device)
+            v3 = batch['v3'].to(device)
+            v4 = batch['v4'].to(device)
+            a2 = batch['a2'].to(device)
+            labels = batch['label'].to(device)
+
+            with autocast():
+                outputs = model(input_ids, attention_mask, v1, v3, v4, a2)
                 loss = criterion(outputs, labels)
-            
+                loss = loss / accumulation_steps
+
             scaler.scale(loss).backward()
-            
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            
-            train_loss += loss.item()
+
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            train_loss += loss.item() * accumulation_steps
             _, predicted = outputs.max(1)
             train_total += labels.size(0)
             train_correct += predicted.eq(labels).sum().item()
-            
-            # Clear memory
-            del v1, v2, v3, v4, a2, labels, outputs, loss
-            torch.cuda.empty_cache()
-        
+
         train_loss /= len(train_loader)
-        train_acc = train_correct / train_total
+        train_accuracy = train_correct / train_total
         train_losses.append(train_loss)
-        train_accs.append(train_acc)
-        
+        train_accuracies.append(train_accuracy)
+
+        # Validation phase
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
-        
+
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
-                v1, v2, v3, v4, a2, labels = [b.to(device) for b in batch.values()]
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    outputs = model(v1, v2, v3, v4, a2)
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                v1 = batch['v1'].to(device)
+                v3 = batch['v3'].to(device)
+                v4 = batch['v4'].to(device)
+                a2 = batch['a2'].to(device)
+                labels = batch['label'].to(device)
+
+                with autocast():
+                    outputs = model(input_ids, attention_mask, v1, v3, v4, a2)
                     loss = criterion(outputs, labels)
-                
+
                 val_loss += loss.item()
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
-                
-                # Clear memory
-                del v1, v2, v3, v4, a2, labels, outputs, loss
-                torch.cuda.empty_cache()
-        
-        val_loss /= len(val_loader)
-        val_acc = val_correct / val_total
-        val_losses.append(val_loss)
-        val_accs.append(val_acc)
-        
-        scheduler.step()
-        
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
-        
-        # Clear cache
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-    return model, train_losses, val_losses, train_accs, val_accs
 
-# 4. Evaluation and Visualization functions
+        val_loss /= len(val_loader)
+        val_accuracy = val_correct / val_total
+        val_losses.append(val_loss)
+        val_accuracies.append(val_accuracy)
+
+        epoch_time = time.time() - start_time
+
+        print(f'Epoch {epoch+1}/{num_epochs}:')
+        print(f'Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}')
+        print(f'Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}')
+        print(f'Epoch Time: {epoch_time:.2f} seconds')
+
+        scheduler.step(val_loss)
+
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), os.path.join('/content/drive/MyDrive/EANN', 'best_model.pth'))
+            print("New best model saved.")
+        else:
+            epochs_without_improvement += 1
+            if early_stop == "on" and epochs_without_improvement == patience:
+                print(f'Early stopping triggered after {epoch+1} epochs')
+                break
+
+        # Print GPU usage
+        print_gpu_usage()
+
+    print("Training completed.")
+
+    # Save the final model
+    torch.save(model.state_dict(), os.path.join('/content/drive/MyDrive/EANN', 'final_model.pth'))
+    print("Final model saved.")
+
+    # Plot final training curves
+    plot_training_curves(train_losses, val_losses, train_accuracies, val_accuracies)
+
+    return model
+
+# Function to plot final training curves
+def plot_training_curves(train_losses, val_losses, train_accuracies, val_accuracies):
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Training and Validation Loss')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracies, label='Train Accuracy')
+    plt.plot(val_accuracies, label='Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Training and Validation Accuracy')
+
+    plt.tight_layout()
+    plt.show()  # Display the plot in the terminal
+    plt.savefig(os.path.join('/content/drive/MyDrive/EANN', 'final_training_curves.png'))
+    plt.close()
+
+# Evaluation function
 def evaluate_model(model, test_loader):
+    print("Starting model evaluation...")
     model.eval()
     all_preds = []
     all_labels = []
-    
+
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluation"):
-            v1, v2, v3, v4, a2, labels = [b.to(device) for b in batch.values()]
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(v1, v2, v3, v4, a2)
-            _, predicted = outputs.max(1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            
-            # Clear memory
-            del v1, v2, v3, v4, a2, labels, outputs
-            torch.cuda.empty_cache()
-    
-    return np.array(all_preds), np.array(all_labels)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            v1 = batch['v1'].to(device)
+            v3 = batch['v3'].to(device)
+            v4 = batch['v4'].to(device)
+            a2 = batch['a2'].to(device)
+            labels = batch['label'].to(device)
 
-def plot_confusion_matrix(y_true, y_pred, classes):
-    cm = confusion_matrix(y_true, y_pred)
+            with autocast():
+                outputs = model(input_ids, attention_mask, v1, v3, v4, a2)
+            _, preds = outputs.max(1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    # Print classification report
+    report = classification_report(all_labels, all_preds, target_names=le.classes_, output_dict=True)
+    print("Classification Report:")
+    print(classification_report(all_labels, all_preds, target_names=le.classes_))
+
+    # Plot confusion matrix
+    plot_confusion_matrix(all_labels, all_preds, le.classes_)
+
+    # Plot per-class metrics
+    plot_per_class_metrics(report)
+
+    print("Evaluation completed. Visualizations have been displayed.")
+
+# Function to plot confusion matrix
+def plot_confusion_matrix(all_labels, all_preds, class_names):
+    cm = confusion_matrix(all_labels, all_preds)
     plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
-    plt.title('Confusion Matrix')
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
     plt.xlabel('Predicted')
     plt.ylabel('True')
-    plt.savefig('confusion_matrix.png')
-    plt.close()
-
-def plot_roc_curve(y_true, y_pred_proba, classes):
-    n_classes = len(classes)
-    fpr = dict()
-    tpr = dict()
-    roc_auc = dict()
-
-    for i in range(n_classes):
-        fpr[i], tpr[i], _ = roc_curve((y_true == i).astype(int), y_pred_proba[:, i])
-        roc_auc[i] = auc(fpr[i], tpr[i])
-
-    plt.figure(figsize=(10, 8))
-
-    for i, color in zip(range(n_classes), plt.cm.rainbow(np.linspace(0, 1, n_classes))):
-        plt.plot(fpr[i], tpr[i], color=color, lw=2,
-                 label=f'ROC curve of class {classes[i]} (area = {roc_auc[i]:0.2f})')
-    
-    plt.plot([0, 1], [0, 1], 'k--', lw=2)
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic (ROC) Curve')
-    plt.legend(loc="lower right")
-    plt.savefig('roc_curve.png')
-    plt.close()
-
-def plot_loss_accuracy(train_losses, val_losses, train_accs, val_accs):
-    epochs = range(1, len(train_losses) + 1)
-    
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
-    plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
-    plt.title('Training and Validation Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs, train_accs, 'b-', label='Training Accuracy')
-    plt.plot(epochs, val_accs, 'r-', label='Validation Accuracy')
-    plt.title('Training and Validation Accuracy')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    
+    plt.title('Confusion Matrix')
     plt.tight_layout()
-    plt.savefig('loss_accuracy.png')
+    plt.show()  # Display the plot in the terminal
+    plt.savefig(os.path.join('/content/drive/MyDrive/EANN', 'confusion_matrix.png'))
     plt.close()
 
-# Main execution
+# Function to plot per-class metrics
+def plot_per_class_metrics(report):
+    classes = list(report.keys())[:-3]  # Exclude 'accuracy', 'macro avg', and 'weighted avg'
+    precision = [report[c]['precision'] for c in classes]
+    recall = [report[c]['recall'] for c in classes]
+    f1_score = [report[c]['f1-score'] for c in classes]
+
+    x = np.arange(len(classes))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    rects1 = ax.bar(x - width, precision, width, label='Precision')
+    rects2 = ax.bar(x, recall, width, label='Recall')
+    rects3 = ax.bar(x + width, f1_score, width, label='F1-score')
+
+    ax.set_ylabel('Scores')
+    ax.set_title('Per-class Metrics')
+    ax.set_xticks(x)
+    ax.set_xticklabels(classes, rotation=45, ha='right')
+    ax.legend()
+
+    fig.tight_layout()
+    plt.show()  # Display the plot in the terminal
+    plt.savefig(os.path.join('/content/drive/MyDrive/EANN', 'per_class_metrics.png'))
+    plt.close()
+
+# Main execution block
 if __name__ == "__main__":
-    print("Initializing model...")
-    model = EmotionClassifier()
-    
-    print("Starting training...")
-    trained_model, train_losses, val_losses, train_accs, val_accs = train_model(model, train_loader, test_loader)
-    
-    print("Evaluating model...")
-    y_pred, y_true = evaluate_model(trained_model, test_loader)
-    
-    print("Generating visualizations...")
-    plot_confusion_matrix(y_true, y_pred, le.classes_)
-    
-    trained_model.eval()
-    y_pred_proba = []
+    # Instantiate the model
+    model = MultimodalEmotionRecognition()
+    model = model.to(device)
+    print("Model instantiated successfully.")
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+
+    # Debug information
+    print("\nDebug information:")
+    batch = next(iter(train_loader))
+    input_ids = batch['input_ids'].to(device)
+    attention_mask = batch['attention_mask'].to(device)
+    v1 = batch['v1'].to(device)
+    v3 = batch['v3'].to(device)
+    v4 = batch['v4'].to(device)
+    a2 = batch['a2'].to(device)
+
+    print(f"Input IDs shape: {input_ids.shape}")
+    print(f"Attention Mask shape: {attention_mask.shape}")
+    print(f"V1 shape: {v1.shape}")
+    print(f"V3 shape: {v3.shape}")
+    print(f"V4 shape: {v4.shape}")
+    print(f"A2 shape: {a2.shape}")
+
+    # Forward pass for debugging
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Getting probabilities"):
-            v1, v2, v3, v4, a2, _ = [b.to(device) for b in batch.values()]
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = trained_model(v1, v2, v3, v4, a2)
-            y_pred_proba.extend(F.softmax(outputs, dim=1).cpu().numpy())
-            
-            # Clear memory
-            del v1, v2, v3, v4, a2, outputs
-            torch.cuda.empty_cache()
-    
-    y_pred_proba = np.array(y_pred_proba)
-    plot_roc_curve(y_true, y_pred_proba, le.classes_)
-    
-    plot_loss_accuracy(train_losses, val_losses, train_accs, val_accs)
-    
-    print("Evaluation metrics:")
-    print(classification_report(y_true, y_pred, target_names=le.classes_))
-    
-    print("Training and evaluation completed. Visualizations saved as PNG files.")
+        with autocast():
+            outputs = model(input_ids, attention_mask, v1, v3, v4, a2)
+        print(f"Model output shape: {outputs.shape}")
+
+    # Train the model
+    trained_model = train_model(model, train_loader, test_loader)
+
+    # Evaluate the model
+    evaluate_model(trained_model, test_loader)
+
+    print("Training and evaluation completed. Visualizations have been displayed and saved.")
