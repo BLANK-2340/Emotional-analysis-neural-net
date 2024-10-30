@@ -20,7 +20,7 @@ import os
 import GPUtil
 
 # Early stopping toggle
-early_stop = "on"  # Set to "off" to disable early stopping
+early_stop = "off"  # Set to "off" to disable early stopping
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -42,7 +42,7 @@ def print_gpu_usage():
         print(f"GPU Memory Utilization: {gpu.memoryUtil * 100:.2f}%")
 
 # Load the dataset
-file_path = 'File path'
+file_path = '/content/drive/MyDrive/EANN/MELD.xlsx'
 df = pd.read_excel(file_path)
 print("Dataset loaded successfully.")
 
