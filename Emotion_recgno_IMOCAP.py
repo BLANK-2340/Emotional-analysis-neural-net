@@ -62,7 +62,7 @@ log_and_print(f"Hyperparameters: batch_size={batch_size}, accumulation_steps={ac
               f"max_length={max_length}, num_epochs={num_epochs}, patience={patience}, learning_rate={learning_rate}")
 
 # Load and preprocess data
-file_path = 'file path'
+file_path = '/content/drive/MyDrive/EANN/Filtered_IMOCAP.xlsx'
 df = pd.read_excel(file_path)
 log_and_print(f"Data loaded from {file_path}")
 
