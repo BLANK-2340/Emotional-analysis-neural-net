@@ -1,6 +1,5 @@
 # ======================================
 # Emotion Recognition Model
-# Author: Armaan singh 
 # Last Updated: October 2024
 # ======================================
 
