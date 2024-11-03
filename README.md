@@ -791,10 +791,5 @@ If you use this code in your research, please cite:
 ```
 -->
 
-## Acknowledgments
 
-- MELD dataset creators
-- IEMOCAP dataset creators
-- PyTorch team
-- Hugging Face team
 
